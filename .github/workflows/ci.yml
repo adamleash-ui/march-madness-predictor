@@ -34,8 +34,8 @@ jobs:
               build_training_data, build_submission_data,
           )
           from src.predictor import (
-              build_pipelines, evaluate_models,
-              train_final_model, generate_submission,
+              build_base_pipelines, evaluate_models,
+              EnsemblePredictor, generate_submission,
           )
           from src.visualize import (
               plot_pred_distribution, plot_seed_win_prob,
