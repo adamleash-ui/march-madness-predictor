@@ -197,7 +197,7 @@ def extract_seeds(seeds: pd.DataFrame) -> pd.DataFrame:
 
 
 # ---------------------------------------------------------------------------
-# 3. Massey Ordinals — consensus ranking
+# 4. Massey Ordinals — consensus ranking
 # ---------------------------------------------------------------------------
 
 def compute_massey_ranks(massey: pd.DataFrame, day_cutoff: int = 133) -> pd.DataFrame:
@@ -217,7 +217,174 @@ def compute_massey_ranks(massey: pd.DataFrame, day_cutoff: int = 133) -> pd.Data
 
 
 # ---------------------------------------------------------------------------
-# 4. Build matchup feature rows
+# 5. Strength of Schedule
+# ---------------------------------------------------------------------------
+
+def compute_sos(compact_df: pd.DataFrame, team_stats_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Compute Strength of Schedule (SOS) for each (Season, TeamID).
+
+    SOS = average opponent win_rate across all regular season games.
+
+    Args:
+        compact_df: MRegularSeasonCompactResults DataFrame
+        team_stats_df: output of compute_team_season_stats (has win_rate per team-season)
+
+    Returns DataFrame with (Season, TeamID, sos) columns.
+    """
+    # Build (Season, TeamID, OppID) from both winner and loser perspectives
+    rows = []
+    for us_col, opp_col in [("WTeamID", "LTeamID"), ("LTeamID", "WTeamID")]:
+        g = compact_df[["Season", us_col, opp_col]].copy()
+        g.columns = ["Season", "TeamID", "OppID"]
+        rows.append(g)
+
+    all_games = pd.concat(rows, ignore_index=True)
+
+    # Merge opponent win_rate via join on (Season, OppID)
+    win_rates = team_stats_df[["Season", "TeamID", "win_rate"]].rename(
+        columns={"TeamID": "OppID", "win_rate": "opp_win_rate"}
+    )
+    all_games = all_games.merge(win_rates, on=["Season", "OppID"], how="left")
+
+    sos = all_games.groupby(["Season", "TeamID"])["opp_win_rate"].mean().reset_index()
+    sos.columns = ["Season", "TeamID", "sos"]
+    return sos
+
+
+# ---------------------------------------------------------------------------
+# 6. Adjusted Efficiency (KenPom-style single-pass)
+# ---------------------------------------------------------------------------
+
+def compute_adjusted_efficiency(detailed_df: pd.DataFrame, team_stats_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Compute KenPom-style adjusted offensive and defensive efficiency.
+
+    Single-pass adjustment:
+        adj_off_eff = off_eff - opp_avg_def_eff + league_avg_def_eff
+        adj_def_eff = def_eff - opp_avg_off_eff + league_avg_off_eff
+        adj_net_eff = adj_off_eff - adj_def_eff
+
+    Args:
+        detailed_df: MRegularSeasonDetailedResults DataFrame
+        team_stats_df: output of compute_team_season_stats
+
+    Returns DataFrame with (Season, TeamID, adj_off_eff, adj_def_eff, adj_net_eff).
+    """
+    # Slim lookup table for opponent efficiencies
+    eff_slim = team_stats_df[["Season", "TeamID", "off_eff", "def_eff"]].copy()
+
+    # League averages per season
+    league_avg = team_stats_df.groupby("Season").agg(
+        league_avg_off_eff=("off_eff", "mean"),
+        league_avg_def_eff=("def_eff", "mean"),
+    ).reset_index()
+
+    # Build per-game records from both perspectives — (Season, TeamID, OppID)
+    rows = []
+    for us, them in [("W", "L"), ("L", "W")]:
+        g = detailed_df[["Season", f"{us}TeamID", f"{them}TeamID"]].copy()
+        g.columns = ["Season", "TeamID", "OppID"]
+        rows.append(g)
+
+    all_games = pd.concat(rows, ignore_index=True)
+
+    # Join opponent efficiency via merge on (Season, OppID)
+    opp_eff = eff_slim.rename(columns={
+        "TeamID": "OppID",
+        "off_eff": "opp_off_eff",
+        "def_eff": "opp_def_eff",
+    })
+    all_games = all_games.merge(opp_eff, on=["Season", "OppID"], how="left")
+
+    # Average opponent efficiency per team-season
+    opp_avg = all_games.groupby(["Season", "TeamID"]).agg(
+        opp_avg_off_eff=("opp_off_eff", "mean"),
+        opp_avg_def_eff=("opp_def_eff", "mean"),
+    ).reset_index()
+
+    # Merge with team stats and league averages
+    result = eff_slim.merge(opp_avg, on=["Season", "TeamID"], how="left")
+    result = result.merge(league_avg, on="Season", how="left")
+
+    result["adj_off_eff"] = result["off_eff"] - result["opp_avg_def_eff"] + result["league_avg_def_eff"]
+    result["adj_def_eff"] = result["def_eff"] - result["opp_avg_off_eff"] + result["league_avg_off_eff"]
+    result["adj_net_eff"] = result["adj_off_eff"] - result["adj_def_eff"]
+
+    return result[["Season", "TeamID", "adj_off_eff", "adj_def_eff", "adj_net_eff"]]
+
+
+# ---------------------------------------------------------------------------
+# 7. Coach Experience Features
+# ---------------------------------------------------------------------------
+
+def compute_coach_features(coaches_df: pd.DataFrame, tourney_seeds_df: pd.DataFrame, season: int) -> pd.DataFrame:
+    """
+    Compute per-team coach experience features for a given season.
+
+    Features:
+        coach_exp_years:   number of distinct seasons the head coach has coached
+                           (any team) PRIOR to the current season
+        coach_tourney_apps: number of distinct seasons where that coach's team
+                            appeared in tourney seeds PRIOR to the current season
+
+    Head coach = coach with the smallest FirstDayNum for that (Season, TeamID).
+
+    Args:
+        coaches_df: MTeamCoaches DataFrame
+        tourney_seeds_df: MNCAATourneySeeds DataFrame
+        season: the season to compute features for
+
+    Returns DataFrame with (Season, TeamID, coach_exp_years, coach_tourney_apps).
+    """
+    # Identify head coaches for the target season: smallest FirstDayNum per team
+    season_coaches = coaches_df[coaches_df["Season"] == season].copy()
+    head_coaches = (
+        season_coaches.sort_values("FirstDayNum")
+        .groupby("TeamID")
+        .first()
+        .reset_index()[["TeamID", "CoachName"]]
+    )
+    head_coaches["Season"] = season
+
+    # Prior seasons only
+    prior_coaches = coaches_df[coaches_df["Season"] < season]
+
+    # Coach experience: distinct seasons coached (any team) before this season
+    coach_exp = prior_coaches.groupby("CoachName")["Season"].nunique().reset_index()
+    coach_exp.columns = ["CoachName", "coach_exp_years"]
+
+    # Tournament appearances: seasons where coach's team was in tourney seeds
+    # Build (Season, CoachName) for coaches that had tourney teams
+    tourney_seasons = tourney_seeds_df[["Season", "TeamID"]].drop_duplicates()
+    coach_tourney = prior_coaches.merge(tourney_seasons, on=["Season", "TeamID"], how="inner")
+    coach_tourney_apps = coach_tourney.groupby("CoachName")["Season"].nunique().reset_index()
+    coach_tourney_apps.columns = ["CoachName", "coach_tourney_apps"]
+
+    # Merge everything
+    result = head_coaches.merge(coach_exp, on="CoachName", how="left")
+    result = result.merge(coach_tourney_apps, on="CoachName", how="left")
+    result["coach_exp_years"] = result["coach_exp_years"].fillna(0).astype(int)
+    result["coach_tourney_apps"] = result["coach_tourney_apps"].fillna(0).astype(int)
+
+    return result[["Season", "TeamID", "coach_exp_years", "coach_tourney_apps"]]
+
+
+def compute_all_coach_features(coaches_df: pd.DataFrame, tourney_seeds_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Compute coach features for all seasons present in coaches_df.
+
+    Returns DataFrame with (Season, TeamID, coach_exp_years, coach_tourney_apps).
+    """
+    all_seasons = sorted(coaches_df["Season"].unique())
+    frames = []
+    for season in all_seasons:
+        frames.append(compute_coach_features(coaches_df, tourney_seeds_df, season))
+    return pd.concat(frames, ignore_index=True)
+
+
+# ---------------------------------------------------------------------------
+# 8. Build matchup feature rows
 # ---------------------------------------------------------------------------
 
 DIFF_STATS = [
@@ -228,6 +395,9 @@ DIFF_STATS = [
     "fg_pct", "fg3_pct", "ft_pct",
     "oreb_rate", "ast_to_ratio", "stl_per_game", "blk_per_game",
     "seed_num", "massey_rank_mean", "massey_rank_min",
+    "sos",
+    "adj_off_eff", "adj_def_eff", "adj_net_eff",
+    "coach_exp_years", "coach_tourney_apps",
 ]
 
 
@@ -236,11 +406,20 @@ def build_team_profile(
     seeds: pd.DataFrame,
     massey: pd.DataFrame,
     recent_form: pd.DataFrame,
+    sos: pd.DataFrame = None,
+    adj_eff: pd.DataFrame = None,
+    coach_features: pd.DataFrame = None,
 ) -> pd.DataFrame:
     """Merge all per-team features into a single (Season, TeamID) table."""
     profile = team_stats.merge(seeds, on=["Season", "TeamID"], how="left")
     profile = profile.merge(massey, on=["Season", "TeamID"], how="left")
     profile = profile.merge(recent_form, on=["Season", "TeamID"], how="left")
+    if sos is not None:
+        profile = profile.merge(sos, on=["Season", "TeamID"], how="left")
+    if adj_eff is not None:
+        profile = profile.merge(adj_eff, on=["Season", "TeamID"], how="left")
+    if coach_features is not None:
+        profile = profile.merge(coach_features, on=["Season", "TeamID"], how="left")
     return profile
 
 
@@ -265,8 +444,8 @@ def build_training_data(
     Build one row per tournament game with matchup feature differentials.
 
     Target (label):
-        1  →  lower TeamID won
-        0  →  higher TeamID won
+        1  ->  lower TeamID won
+        0  ->  higher TeamID won
     This matches the Kaggle submission convention.
     """
     profile_idx = profile.set_index(["Season", "TeamID"])
@@ -298,7 +477,7 @@ def build_training_data(
 
 
 # ---------------------------------------------------------------------------
-# 5. Build submission rows (all possible matchups for a season)
+# 9. Build submission rows (all possible matchups for a season)
 # ---------------------------------------------------------------------------
 
 def build_submission_data(
@@ -338,7 +517,7 @@ def build_submission_data(
 
 
 # ---------------------------------------------------------------------------
-# 6. Main pipeline
+# 10. Main pipeline
 # ---------------------------------------------------------------------------
 
 def build_all_features(verbose: bool = True) -> tuple[pd.DataFrame, pd.DataFrame]:
@@ -352,9 +531,11 @@ def build_all_features(verbose: bool = True) -> tuple[pd.DataFrame, pd.DataFrame
     if verbose:
         print("Loading raw data...")
     detailed = pd.read_csv(DATA_DIR / "MRegularSeasonDetailedResults.csv")
+    compact  = pd.read_csv(DATA_DIR / "MRegularSeasonCompactResults.csv")
     tourney  = pd.read_csv(DATA_DIR / "MNCAATourneyCompactResults.csv")
     seeds_raw = pd.read_csv(DATA_DIR / "MNCAATourneySeeds.csv")
     massey_raw = pd.read_csv(DATA_DIR / "MMasseyOrdinals.csv")
+    coaches_raw = pd.read_csv(DATA_DIR / "MTeamCoaches.csv")
     submission = pd.read_csv(DATA_DIR / "SampleSubmissionStage1.csv")
 
     if verbose:
@@ -374,8 +555,20 @@ def build_all_features(verbose: bool = True) -> tuple[pd.DataFrame, pd.DataFrame
     massey = compute_massey_ranks(massey_raw)
 
     if verbose:
+        print("Computing Strength of Schedule (SOS)...")
+    sos = compute_sos(compact, team_stats)
+
+    if verbose:
+        print("Computing adjusted efficiency (KenPom-style)...")
+    adj_eff = compute_adjusted_efficiency(detailed, team_stats)
+
+    if verbose:
+        print("Computing coach experience features...")
+    coach_features = compute_all_coach_features(coaches_raw, seeds_raw)
+
+    if verbose:
         print("Building team profiles...")
-    profile = build_team_profile(team_stats, seeds, massey, recent_form)
+    profile = build_team_profile(team_stats, seeds, massey, recent_form, sos, adj_eff, coach_features)
 
     if verbose:
         print("Building training matchups...")
@@ -391,6 +584,7 @@ def build_all_features(verbose: bool = True) -> tuple[pd.DataFrame, pd.DataFrame
         print(f"Submission set: {sub_df.shape[0]} matchups")
         print("\nFeature columns:\n  " + "\n  ".join(diff_cols))
         print(f"\nLabel balance:\n{train_df['label'].value_counts()}")
+        print(f"\nNew features: sos, adj_off_eff, adj_def_eff, adj_net_eff, coach_exp_years, coach_tourney_apps")
 
     return train_df, sub_df
 

@@ -36,6 +36,9 @@ FEATURE_COLS = [
     "diff_fg_pct", "diff_fg3_pct", "diff_ft_pct",
     "diff_oreb_rate", "diff_ast_to_ratio", "diff_stl_per_game", "diff_blk_per_game",
     "diff_seed_num", "diff_massey_rank_mean", "diff_massey_rank_min",
+    "diff_sos",
+    "diff_adj_off_eff", "diff_adj_def_eff", "diff_adj_net_eff",
+    "diff_coach_exp_years", "diff_coach_tourney_apps",
 ]
 
 N_FOLDS = 5
@@ -124,23 +127,29 @@ def _season_oof_predict(pipe, X, y, seasons) -> np.ndarray:
 # ---------------------------------------------------------------------------
 
 def build_base_pipelines() -> dict[str, Pipeline]:
-    """Three base learners, each wrapped in a StandardScaler pipeline."""
+    """Three base learners, each wrapped in a StandardScaler pipeline.
+
+    Hyperparameters tuned for ~1400 samples and 28+ features:
+      - LogisticRegression: C=0.05 (more regularization with more features)
+      - RandomForest: n_estimators=500, max_depth=5, min_samples_leaf=8
+      - GradientBoosting: n_estimators=200, max_depth=3, learning_rate=0.03, subsample=0.8
+    """
     return {
         "logistic": Pipeline([
             ("scaler", StandardScaler()),
-            ("clf", LogisticRegression(C=0.1, max_iter=1000, random_state=42)),
+            ("clf", LogisticRegression(C=0.05, max_iter=1000, random_state=42)),
         ]),
         "random_forest": Pipeline([
             ("scaler", StandardScaler()),
             ("clf", RandomForestClassifier(
-                n_estimators=500, max_depth=4, min_samples_leaf=10,
+                n_estimators=500, max_depth=5, min_samples_leaf=8,
                 random_state=42, n_jobs=-1,
             )),
         ]),
         "gradient_boosting": Pipeline([
             ("scaler", StandardScaler()),
             ("clf", GradientBoostingClassifier(
-                n_estimators=300, max_depth=3, learning_rate=0.05,
+                n_estimators=200, max_depth=3, learning_rate=0.03,
                 subsample=0.8, random_state=42,
             )),
         ]),
