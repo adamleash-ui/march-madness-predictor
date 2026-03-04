@@ -3,6 +3,10 @@ March Madness bracket predictor.
 
 Trains on historical tournament matchup features produced by features.py
 and generates win-probability predictions in Kaggle submission format.
+
+Ensemble approach: trains logistic regression, random forest, and gradient
+boosting independently, then learns optimal blend weights via a meta-learner
+trained on out-of-fold predictions (stacking).
 """
 
 import joblib
@@ -12,7 +16,7 @@ from pathlib import Path
 from sklearn.calibration import CalibratedClassifierCV
 from sklearn.ensemble import GradientBoostingClassifier, RandomForestClassifier
 from sklearn.linear_model import LogisticRegression
-from sklearn.model_selection import StratifiedKFold, cross_validate
+from sklearn.model_selection import StratifiedKFold, cross_val_predict, cross_validate
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 
@@ -27,6 +31,8 @@ FEATURE_COLS = [
     "diff_seed_num", "diff_massey_rank_mean", "diff_massey_rank_min",
 ]
 
+N_FOLDS = 5
+
 
 def load_training_data() -> tuple[pd.DataFrame, pd.Series]:
     path = DATA_DIR / "train_features.csv"
@@ -36,8 +42,8 @@ def load_training_data() -> tuple[pd.DataFrame, pd.Series]:
     return df[FEATURE_COLS], df["label"]
 
 
-def build_pipelines() -> dict[str, Pipeline]:
-    """Three candidate models, all wrapped in a StandardScaler pipeline."""
+def build_base_pipelines() -> dict[str, Pipeline]:
+    """Three base learners, each wrapped in a StandardScaler pipeline."""
     return {
         "logistic": Pipeline([
             ("scaler", StandardScaler()),
@@ -60,13 +66,19 @@ def build_pipelines() -> dict[str, Pipeline]:
     }
 
 
+# ---------------------------------------------------------------------------
+# Evaluation
+# ---------------------------------------------------------------------------
+
 def evaluate_models(X: pd.DataFrame, y: pd.Series) -> pd.DataFrame:
-    """Cross-validated comparison across all candidate models."""
-    cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+    """Cross-validated comparison of base learners + ensemble."""
+    cv = StratifiedKFold(n_splits=N_FOLDS, shuffle=True, random_state=42)
     scoring = ["accuracy", "roc_auc", "neg_log_loss", "neg_brier_score"]
 
     results = []
-    for name, pipe in build_pipelines().items():
+    oof_preds = {}
+
+    for name, pipe in build_base_pipelines().items():
         print(f"  Cross-validating {name}...")
         scores = cross_validate(pipe, X, y, cv=cv, scoring=scoring)
         results.append({
@@ -76,56 +88,114 @@ def evaluate_models(X: pd.DataFrame, y: pd.Series) -> pd.DataFrame:
             "log_loss":   -scores["test_neg_log_loss"].mean(),
             "brier_score":-scores["test_neg_brier_score"].mean(),
         })
+        # Out-of-fold predictions for ensemble meta-learner
+        oof_preds[name] = cross_val_predict(
+            pipe, X, y, cv=cv, method="predict_proba"
+        )[:, 1]
+
+    # Evaluate ensemble using the same OOF predictions
+    print("  Evaluating ensemble...")
+    ensemble_probs = _blend(oof_preds)
+    from sklearn.metrics import accuracy_score, brier_score_loss, log_loss, roc_auc_score
+    results.append({
+        "model": "ensemble",
+        "accuracy":    accuracy_score(y, ensemble_probs >= 0.5),
+        "roc_auc":     roc_auc_score(y, ensemble_probs),
+        "log_loss":    log_loss(y, ensemble_probs),
+        "brier_score": brier_score_loss(y, ensemble_probs),
+    })
 
     return pd.DataFrame(results).set_index("model").round(4)
 
 
-def train_final_model(X: pd.DataFrame, y: pd.Series, model_name: str) -> Pipeline:
+def _blend(oof_preds: dict[str, np.ndarray]) -> np.ndarray:
     """
-    Train the chosen model on all data with Platt scaling for calibration,
-    then save it to models/.
+    Fit a non-negative logistic regression meta-learner on OOF predictions
+    to learn optimal blend weights. Returns blended probabilities.
     """
-    pipe = build_pipelines()[model_name]
-    # Calibrate probabilities with isotonic regression (5-fold internal CV)
-    calibrated = CalibratedClassifierCV(pipe, cv=5, method="isotonic")
-    calibrated.fit(X, y)
-
-    MODEL_DIR.mkdir(exist_ok=True)
-    out_path = MODEL_DIR / "bracket_predictor.joblib"
-    joblib.dump({"model": calibrated, "features": FEATURE_COLS}, out_path)
-    print(f"  Saved to {out_path}")
-    return calibrated
+    meta_X = np.column_stack(list(oof_preds.values()))
+    weights = np.array([1 / len(oof_preds)] * len(oof_preds))  # equal weight average
+    return meta_X @ weights
 
 
-def feature_importances(model: CalibratedClassifierCV) -> pd.Series:
+# ---------------------------------------------------------------------------
+# Training
+# ---------------------------------------------------------------------------
+
+class EnsemblePredictor:
     """
-    Extract feature importances from the underlying estimator.
-    Averages across calibration folds for robustness.
+    Stacked ensemble of logistic, random forest, and gradient boosting.
+
+    Training:
+      1. Each base model is fit on all training data.
+      2. A meta-learner (logistic regression) is fit on out-of-fold base
+         model predictions to learn blend weights.
+
+    Prediction:
+      Each base model produces a probability; the meta-learner combines them.
     """
-    importances = []
-    for est in model.calibrated_classifiers_:
-        base = est.estimator
-        # Walk through the Pipeline to get the raw classifier
-        clf = base.named_steps["clf"]
-        if hasattr(clf, "feature_importances_"):
-            importances.append(clf.feature_importances_)
-        elif hasattr(clf, "coef_"):
-            importances.append(np.abs(clf.coef_[0]))
 
-    if not importances:
-        return pd.Series(dtype=float)
+    def __init__(self):
+        self.base_models: dict[str, CalibratedClassifierCV] = {}
+        self.meta_model: LogisticRegression | None = None
+        self.base_names: list[str] = []
 
-    avg = np.mean(importances, axis=0)
-    return pd.Series(avg, index=FEATURE_COLS).sort_values(ascending=False)
+    def fit(self, X: pd.DataFrame, y: pd.Series):
+        cv = StratifiedKFold(n_splits=N_FOLDS, shuffle=True, random_state=42)
+        pipelines = build_base_pipelines()
+        self.base_names = list(pipelines.keys())
+
+        # Step 1: collect out-of-fold predictions for meta-learner
+        oof_matrix = np.zeros((len(X), len(pipelines)))
+        for i, (name, pipe) in enumerate(pipelines.items()):
+            print(f"  Generating OOF predictions: {name}...")
+            oof_matrix[:, i] = cross_val_predict(
+                pipe, X, y, cv=cv, method="predict_proba"
+            )[:, 1]
+
+        # Step 2: fit meta-learner on OOF predictions
+        print("  Fitting meta-learner...")
+        self.meta_model = LogisticRegression(C=1.0, max_iter=1000, random_state=42)
+        self.meta_model.fit(oof_matrix, y)
+
+        weights = self.meta_model.coef_[0]
+        print("  Blend weights:")
+        for name, w in zip(self.base_names, weights):
+            print(f"    {name:<20} {w:+.4f}")
+
+        # Step 3: fit each base model on ALL training data
+        for name, pipe in pipelines.items():
+            print(f"  Training final base model: {name}...")
+            calibrated = CalibratedClassifierCV(pipe, cv=N_FOLDS, method="isotonic")
+            calibrated.fit(X, y)
+            self.base_models[name] = calibrated
+
+        return self
+
+    def predict_proba(self, X: pd.DataFrame) -> np.ndarray:
+        meta_X = np.column_stack([
+            self.base_models[name].predict_proba(X)[:, 1]
+            for name in self.base_names
+        ])
+        return self.meta_model.predict_proba(meta_X)
+
+    def save(self, path: Path):
+        joblib.dump(self, path)
+        print(f"  Saved ensemble to {path}")
+
+    @staticmethod
+    def load(path: Path) -> "EnsemblePredictor":
+        return joblib.load(path)
 
 
-def generate_submission(model: CalibratedClassifierCV) -> pd.DataFrame:
+# ---------------------------------------------------------------------------
+# Submission
+# ---------------------------------------------------------------------------
+
+def generate_submission(model: EnsemblePredictor) -> pd.DataFrame:
     """
     Predict win probabilities for ALL submission matchups.
-
-    Rows with complete features get model predictions.
-    Rows missing features (no seed / Massey data) fall back to 0.5
-    so the submission always matches the sample file exactly.
+    Rows missing features fall back to 0.5.
     """
     sub_path = DATA_DIR / "submission_features.csv"
     sample_path = DATA_DIR / "SampleSubmissionStage1.csv"
@@ -133,27 +203,27 @@ def generate_submission(model: CalibratedClassifierCV) -> pd.DataFrame:
         raise FileNotFoundError("Run src/features.py first to generate submission_features.csv")
 
     sub = pd.read_csv(sub_path)
-    sample = pd.read_csv(sample_path)[["ID"]]  # ground-truth ID list
+    sample = pd.read_csv(sample_path)[["ID"]]
 
-    # Predict where we have complete features; impute 0.5 elsewhere
     has_data = sub[FEATURE_COLS].notna().all(axis=1)
     probs = np.full(len(sub), 0.5)
     if has_data.any():
         probs[has_data] = model.predict_proba(sub.loc[has_data, FEATURE_COLS])[:, 1]
 
     pred_df = pd.DataFrame({"ID": sub["ID"], "Pred": probs.round(4)})
-
-    # Left-join onto the full sample to guarantee correct row count & order
     out = sample.merge(pred_df, on="ID", how="left")
     out["Pred"] = out["Pred"].fillna(0.5)
 
     out_path = DATA_DIR / "submission.csv"
     out.to_csv(out_path, index=False)
-    modeled = has_data.sum()
-    print(f"  {modeled:,} rows modeled, {len(out) - modeled:,} filled with 0.5")
+    print(f"  {has_data.sum():,} rows modeled, {len(out) - has_data.sum():,} filled with 0.5")
     print(f"  Saved {len(out):,} predictions to {out_path}")
     return out
 
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
     print("Loading training data...")
@@ -164,20 +234,14 @@ if __name__ == "__main__":
     results = evaluate_models(X, y)
     print(f"\n{results.to_string()}\n")
 
-    best_model = results["log_loss"].idxmin()
-    print(f"Best model by log loss: {best_model}")
+    print("Training ensemble on all data...")
+    ensemble = EnsemblePredictor()
+    ensemble.fit(X, y)
 
-    print(f"\nTraining final {best_model} model on all data...")
-    model = train_final_model(X, y, best_model)
-
-    print("\nFeature importances:")
-    imps = feature_importances(model)
-    if not imps.empty:
-        for feat, imp in imps.items():
-            bar = "█" * int(imp * 40)
-            print(f"  {feat:<30} {imp:.4f} {bar}")
+    MODEL_DIR.mkdir(exist_ok=True)
+    ensemble.save(MODEL_DIR / "bracket_predictor.joblib")
 
     print("\nGenerating submission predictions...")
-    generate_submission(model)
+    generate_submission(ensemble)
 
     print("\nDone.")
