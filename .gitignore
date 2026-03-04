@@ -1,0 +1,11 @@
+venv/
+__pycache__/
+*.pyc
+*.pyo
+.DS_Store
+data/*.csv
+data/*.json
+notebooks/.ipynb_checkpoints/
+*.egg-info/
+dist/
+build/
