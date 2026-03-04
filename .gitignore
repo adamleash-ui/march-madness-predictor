@@ -1,5 +1,10 @@
 venv/
 __pycache__/
+
+# Next.js
+web/node_modules/
+web/.next/
+web/.env*.local
 *.pyc
 *.pyo
 .DS_Store

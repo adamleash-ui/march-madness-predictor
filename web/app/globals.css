@@ -1,0 +1,49 @@
+@import "tailwindcss";
+
+@theme {
+  --color-navy: #0F172A;
+  --color-card: #1E293B;
+  --color-card-hover: #263548;
+  --color-orange: #F97316;
+  --color-orange-dark: #EA580C;
+  --color-orange-glow: #F9731640;
+  --color-slate-400: #94A3B8;
+  --color-slate-500: #64748B;
+  --color-green: #22C55E;
+  --color-red: #EF4444;
+  --font-sans: var(--font-geist-sans);
+  --font-mono: var(--font-geist-mono);
+}
+
+:root {
+  --background: #0F172A;
+  --foreground: #F8FAFC;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  background: var(--background);
+  color: var(--foreground);
+  font-family: var(--font-geist-sans), system-ui, sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* Custom scrollbar */
+::-webkit-scrollbar { width: 6px; height: 6px; }
+::-webkit-scrollbar-track { background: #1E293B; }
+::-webkit-scrollbar-thumb { background: #475569; border-radius: 3px; }
+::-webkit-scrollbar-thumb:hover { background: #F97316; }
+
+/* Orange glow utility */
+.orange-glow {
+  box-shadow: 0 0 20px #F9731640, 0 0 40px #F9731620;
+}
+
+/* Bracket connector lines */
+.bracket-connector {
+  border-right: 2px solid #334155;
+  position: relative;
+}
