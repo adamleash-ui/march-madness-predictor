@@ -1,0 +1,84 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  lint-and-test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt ruff
+
+      - name: Lint
+        run: ruff check src/
+
+      - name: Smoke test — import all modules
+        run: |
+          python -c "
+          from src.features import (
+              compute_team_season_stats, extract_seeds,
+              compute_massey_ranks, build_team_profile,
+              build_training_data, build_submission_data,
+          )
+          from src.predictor import (
+              build_pipelines, evaluate_models,
+              train_final_model, generate_submission,
+          )
+          from src.visualize import (
+              plot_pred_distribution, plot_seed_win_prob,
+              plot_upset_heatmap, plot_calibration,
+              plot_feature_importances, plot_top_predictions,
+          )
+          from src.data_loader import fetch_team_stats, build_matchup_features
+          print('All imports OK')
+          "
+
+      - name: Smoke test — feature engineering on synthetic data
+        run: |
+          python -c "
+          import pandas as pd
+          import numpy as np
+          from src.features import compute_team_season_stats, extract_seeds
+
+          # Minimal synthetic detailed results
+          rows = []
+          for season in [2023, 2024]:
+              for i in range(20):
+                  rows.append({
+                      'Season': season, 'DayNum': 10 + i,
+                      'WTeamID': 1100, 'LTeamID': 1200,
+                      'WScore': 75, 'LScore': 65, 'WLoc': 'H', 'NumOT': 0,
+                      'WFGM': 28, 'WFGA': 55, 'WFGM3': 7, 'WFGA3': 18,
+                      'WFTM': 12, 'WFTA': 15, 'WOR': 10, 'WDR': 25,
+                      'WAst': 15, 'WTO': 10, 'WStl': 5, 'WBlk': 3, 'WPF': 18,
+                      'LFGM': 24, 'LFGA': 58, 'LFGM3': 5, 'LFGA3': 16,
+                      'LFTM': 12, 'LFTA': 16, 'LOR': 8, 'LDR': 20,
+                      'LAst': 12, 'LTO': 13, 'LStl': 4, 'LBlk': 2, 'LPF': 20,
+                  })
+          detailed = pd.DataFrame(rows)
+          stats = compute_team_season_stats(detailed)
+          assert len(stats) > 0
+          assert 'win_rate' in stats.columns
+          assert 'net_eff' in stats.columns
+
+          # Seed parsing
+          seeds = pd.DataFrame({
+              'Season': [2023, 2023], 'Seed': ['W01', 'X16'], 'TeamID': [1100, 1200]
+          })
+          parsed = extract_seeds(seeds)
+          assert list(parsed['seed_num']) == [1, 16]
+          print('Feature engineering smoke tests passed')
+          "

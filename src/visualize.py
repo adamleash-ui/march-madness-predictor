@@ -82,7 +82,7 @@ def plot_seed_win_prob(subf: pd.DataFrame, sub: pd.DataFrame):
 
     fig, ax = plt.subplots(figsize=(10, 4))
     colors = [RED if p < 0.5 else BLUE for p in df["Pred"]]
-    bars = ax.bar(df["seed_diff"], df["Pred"], color=colors, edgecolor="white", linewidth=0.4)
+    ax.bar(df["seed_diff"], df["Pred"], color=colors, edgecolor="white", linewidth=0.4)
     ax.axhline(0.5, color="black", linestyle="--", linewidth=1)
     ax.set_xlabel("Seed Differential  (T1 seed − T2 seed)\nnegative = T1 is the better seed")
     ax.set_ylabel("Avg Predicted Win Prob (T1)")
@@ -128,8 +128,10 @@ def plot_upset_heatmap(seeds_raw: pd.DataFrame, tourney: pd.DataFrame):
     fig, ax = plt.subplots(figsize=(10, 8))
     im = ax.imshow(matrix.values.astype(float), cmap=cmap, vmin=0, vmax=1,
                    aspect="auto", origin="upper")
-    ax.set_xticks(range(16)); ax.set_xticklabels(seeds_range, fontsize=8)
-    ax.set_yticks(range(16)); ax.set_yticklabels(seeds_range, fontsize=8)
+    ax.set_xticks(range(16))
+    ax.set_xticklabels(seeds_range, fontsize=8)
+    ax.set_yticks(range(16))
+    ax.set_yticklabels(seeds_range, fontsize=8)
     ax.set_xlabel("Worse Seed (higher number)")
     ax.set_ylabel("Better Seed (lower number)")
     ax.set_title("Historical Win Rate of Better Seed by Matchup\n(blue=better seed dominates, red=frequent upset)")
@@ -167,7 +169,8 @@ def plot_calibration(model, train: pd.DataFrame):
     ax.set_ylabel("Fraction of Positives (actual win rate)")
     ax.set_title("Calibration Curve")
     ax.legend()
-    ax.set_xlim(0, 1); ax.set_ylim(0, 1)
+    ax.set_xlim(0, 1)
+    ax.set_ylim(0, 1)
     fig.tight_layout()
     _save(fig, "4_calibration_curve.png")
 
@@ -258,4 +261,4 @@ if __name__ == "__main__":
     plot_feature_importances(model)
     plot_top_predictions(sub, subf)
 
-    print(f"\nAll plots saved to plots/")
+    print("\nAll plots saved to plots/")

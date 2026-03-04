@@ -209,9 +209,9 @@ def build_training_data(
 
     for _, game in tourney.iterrows():
         season = game["Season"]
-        w, l = game["WTeamID"], game["LTeamID"]
-        t1, t2 = (w, l) if w < l else (l, w)   # t1 always the lower ID
-        label = 1 if w < l else 0               # 1 if lower-ID team won
+        w, loser = game["WTeamID"], game["LTeamID"]
+        t1, t2 = (w, loser) if w < loser else (loser, w)   # t1 always the lower ID
+        label = 1 if w < loser else 0                       # 1 if lower-ID team won
 
         try:
             p1 = profile_idx.loc[(season, t1)]
@@ -319,7 +319,7 @@ def build_all_features(verbose: bool = True) -> tuple[pd.DataFrame, pd.DataFrame
         diff_cols = [c for c in train_df.columns if c.startswith("diff_")]
         print(f"\nTraining set:   {train_df.shape[0]} games x {len(diff_cols)} features")
         print(f"Submission set: {sub_df.shape[0]} matchups")
-        print(f"\nFeature columns:\n  " + "\n  ".join(diff_cols))
+        print("\nFeature columns:\n  " + "\n  ".join(diff_cols))
         print(f"\nLabel balance:\n{train_df['label'].value_counts()}")
 
     return train_df, sub_df

@@ -12,7 +12,6 @@ from pathlib import Path
 from sklearn.calibration import CalibratedClassifierCV
 from sklearn.ensemble import GradientBoostingClassifier, RandomForestClassifier
 from sklearn.linear_model import LogisticRegression
-from sklearn.metrics import accuracy_score, brier_score_loss, log_loss, roc_auc_score
 from sklearn.model_selection import StratifiedKFold, cross_validate
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
