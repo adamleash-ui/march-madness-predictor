@@ -122,7 +122,66 @@ def compute_team_season_stats(detailed: pd.DataFrame) -> pd.DataFrame:
 
 
 # ---------------------------------------------------------------------------
-# 2. Tournament seeds
+# 2. Recent form
+# ---------------------------------------------------------------------------
+
+def compute_recent_form(detailed: pd.DataFrame, n_games: int = 10) -> pd.DataFrame:
+    """
+    Compute per-team stats over their last N regular-season games by DayNum.
+
+    Returns one row per (Season, TeamID) with:
+        recent_win_rate  — win rate in last N games
+        recent_net_eff   — net efficiency (off - def) in last N games
+        trend_win_rate   — recent_win_rate minus full-season win_rate
+        trend_net_eff    — recent_net_eff minus full-season net_eff
+    """
+
+    def possessions(fga, fgm, fta, or_, to):
+        return fga - or_ + to + 0.475 * fta
+
+    rows = []
+    for perspective, us, them in [("W", "W", "L"), ("L", "L", "W")]:
+        g = detailed.copy()
+        g["TeamID"]        = g[f"{us}TeamID"]
+        g["won"]           = 1 if perspective == "W" else 0
+        g["score"]         = g[f"{us}Score"]
+        g["score_allowed"] = g[f"{them}Score"]
+        g["poss"]     = possessions(g[f"{us}FGA"],  g[f"{us}FGM"],  g[f"{us}FTA"],  g[f"{us}OR"],  g[f"{us}TO"])
+        g["opp_poss"] = possessions(g[f"{them}FGA"], g[f"{them}FGM"], g[f"{them}FTA"], g[f"{them}OR"], g[f"{them}TO"])
+        g["off_eff"]  = g["score"]         / g["poss"]     * 100
+        g["def_eff"]  = g["score_allowed"] / g["opp_poss"] * 100
+        rows.append(g[["Season", "TeamID", "DayNum", "won", "off_eff", "def_eff"]])
+
+    combined = pd.concat(rows, ignore_index=True)
+
+    # Keep the last N games per team-season by DayNum
+    combined = combined.sort_values(["Season", "TeamID", "DayNum"])
+    recent = combined.groupby(["Season", "TeamID"]).tail(n_games)
+
+    season_agg = combined.groupby(["Season", "TeamID"]).agg(
+        season_win_rate=("won", "mean"),
+        season_net_eff=("off_eff", "mean"),   # proxy; def_eff subtracted below
+    ).reset_index()
+    season_agg["season_net_eff"] -= combined.groupby(["Season", "TeamID"])["def_eff"].mean().values
+
+    recent_agg = recent.groupby(["Season", "TeamID"]).agg(
+        recent_win_rate=("won", "mean"),
+        recent_off_eff=("off_eff", "mean"),
+        recent_def_eff=("def_eff", "mean"),
+    ).reset_index()
+    recent_agg["recent_net_eff"] = recent_agg["recent_off_eff"] - recent_agg["recent_def_eff"]
+
+    merged = season_agg.merge(recent_agg[["Season", "TeamID", "recent_win_rate", "recent_net_eff"]],
+                              on=["Season", "TeamID"], how="left")
+    merged["trend_win_rate"] = merged["recent_win_rate"] - merged["season_win_rate"]
+    merged["trend_net_eff"]  = merged["recent_net_eff"]  - merged["season_net_eff"]
+
+    return merged[["Season", "TeamID", "recent_win_rate", "recent_net_eff",
+                   "trend_win_rate", "trend_net_eff"]]
+
+
+# ---------------------------------------------------------------------------
+# 3. Tournament seeds
 # ---------------------------------------------------------------------------
 
 def extract_seeds(seeds: pd.DataFrame) -> pd.DataFrame:
@@ -165,6 +224,7 @@ DIFF_STATS = [
     "win_rate", "avg_score", "avg_score_allowed", "avg_margin",
     "off_eff", "def_eff", "net_eff",
     "tempo",
+    "recent_win_rate", "recent_net_eff", "trend_win_rate", "trend_net_eff",
     "fg_pct", "fg3_pct", "ft_pct",
     "oreb_rate", "ast_to_ratio", "stl_per_game", "blk_per_game",
     "seed_num", "massey_rank_mean", "massey_rank_min",
@@ -175,10 +235,12 @@ def build_team_profile(
     team_stats: pd.DataFrame,
     seeds: pd.DataFrame,
     massey: pd.DataFrame,
+    recent_form: pd.DataFrame,
 ) -> pd.DataFrame:
     """Merge all per-team features into a single (Season, TeamID) table."""
     profile = team_stats.merge(seeds, on=["Season", "TeamID"], how="left")
     profile = profile.merge(massey, on=["Season", "TeamID"], how="left")
+    profile = profile.merge(recent_form, on=["Season", "TeamID"], how="left")
     return profile
 
 
@@ -300,6 +362,10 @@ def build_all_features(verbose: bool = True) -> tuple[pd.DataFrame, pd.DataFrame
     team_stats = compute_team_season_stats(detailed)
 
     if verbose:
+        print("Computing recent form (last 10 games)...")
+    recent_form = compute_recent_form(detailed)
+
+    if verbose:
         print("Extracting seeds...")
     seeds = extract_seeds(seeds_raw)
 
@@ -309,7 +375,7 @@ def build_all_features(verbose: bool = True) -> tuple[pd.DataFrame, pd.DataFrame
 
     if verbose:
         print("Building team profiles...")
-    profile = build_team_profile(team_stats, seeds, massey)
+    profile = build_team_profile(team_stats, seeds, massey, recent_form)
 
     if verbose:
         print("Building training matchups...")
