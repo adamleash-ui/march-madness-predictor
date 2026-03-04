@@ -315,6 +315,12 @@ def generate_submission(model: EnsemblePredictor) -> pd.DataFrame:
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
+    import sys as _sys
+    _sys.path.insert(0, str(Path(__file__).parent.parent))
+    # Re-import EnsemblePredictor from the module (not __main__) so joblib
+    # pickles it with the correct path: src.predictor.EnsemblePredictor
+    from src.predictor import EnsemblePredictor  # noqa: F811
+
     print("Loading training data...")
     X, y, seasons = load_training_data()
     print(f"  {X.shape[0]} games, {X.shape[1]} features, {seasons.nunique()} seasons\n")

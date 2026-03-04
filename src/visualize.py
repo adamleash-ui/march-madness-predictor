@@ -13,6 +13,9 @@ import matplotlib.ticker as mticker
 from matplotlib.colors import LinearSegmentedColormap
 from pathlib import Path
 from sklearn.calibration import calibration_curve
+import sys
+sys.path.insert(0, str(Path(__file__).parent.parent))
+from src.predictor import EnsemblePredictor, FEATURE_COLS  # noqa: F401 — needed for joblib unpickling
 
 DATA_DIR  = Path(__file__).parent.parent / "data"
 MODEL_DIR = Path(__file__).parent.parent / "models"
@@ -41,9 +44,8 @@ def _load_artifacts():
     train = pd.read_csv(DATA_DIR / "train_features.csv")
     seeds = pd.read_csv(DATA_DIR / "MNCAATourneySeeds.csv")
     tourney = pd.read_csv(DATA_DIR / "MNCAATourneyCompactResults.csv")
-    payload = joblib.load(MODEL_DIR / "bracket_predictor.joblib")
-    model = payload["model"]
-    features = payload["features"]
+    model = joblib.load(MODEL_DIR / "bracket_predictor.joblib")
+    features = FEATURE_COLS
     return sub, subf, train, seeds, tourney, model, features
 
 
@@ -179,27 +181,31 @@ def plot_calibration(model, train: pd.DataFrame):
 # 5. Feature importances
 # ---------------------------------------------------------------------------
 
-def plot_feature_importances(model):
+def plot_feature_importances(model: EnsemblePredictor):
+    """Extract and plot feature importances from the logistic base model."""
+    logistic = model.base_models.get("logistic")
+    if logistic is None:
+        print("  Skipping feature importances (logistic model not found)")
+        return
+
     importances = []
-    for est in model.calibrated_classifiers_:
+    for est in logistic.calibrated_classifiers_:
         clf = est.estimator.named_steps["clf"]
         if hasattr(clf, "coef_"):
             importances.append(np.abs(clf.coef_[0]))
-        elif hasattr(clf, "feature_importances_"):
-            importances.append(clf.feature_importances_)
 
     if not importances:
-        print("  Skipping feature importances (not available for this model type)")
+        print("  Skipping feature importances (coef_ not available)")
         return
 
     avg = np.mean(importances, axis=0)
-    features = [f.replace("diff_", "").replace("_", " ") for f in model.calibrated_classifiers_[0].estimator.feature_names_in_]
-    s = pd.Series(avg, index=features).sort_values()
+    feat_labels = [f.replace("diff_", "").replace("_", " ") for f in FEATURE_COLS]
+    s = pd.Series(avg, index=feat_labels).sort_values()
 
-    fig, ax = plt.subplots(figsize=(8, 6))
+    fig, ax = plt.subplots(figsize=(8, 7))
     colors = [GOLD if v == s.max() else BLUE for v in s.values]
     s.plot(kind="barh", ax=ax, color=colors, edgecolor="white")
-    ax.set_title("Feature Importances (avg |coefficient| across calibration folds)")
+    ax.set_title("Feature Importances — Logistic Base Model (avg |coefficient|)")
     ax.set_xlabel("Importance")
     fig.tight_layout()
     _save(fig, "5_feature_importances.png")
