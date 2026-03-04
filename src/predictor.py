@@ -4,6 +4,10 @@ March Madness bracket predictor.
 Trains on historical tournament matchup features produced by features.py
 and generates win-probability predictions in Kaggle submission format.
 
+Uses season-aware walk-forward cross-validation: train on seasons 1..N,
+validate on season N+1. This mirrors real deployment conditions where we
+predict a tournament before it happens.
+
 Ensemble approach: trains logistic regression, random forest, and gradient
 boosting independently, then learns optimal blend weights via a meta-learner
 trained on out-of-fold predictions (stacking).
@@ -16,7 +20,8 @@ from pathlib import Path
 from sklearn.calibration import CalibratedClassifierCV
 from sklearn.ensemble import GradientBoostingClassifier, RandomForestClassifier
 from sklearn.linear_model import LogisticRegression
-from sklearn.model_selection import StratifiedKFold, cross_val_predict, cross_validate
+from sklearn.metrics import accuracy_score, brier_score_loss, log_loss, roc_auc_score
+from sklearn.model_selection import StratifiedKFold, cross_validate
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 
@@ -32,15 +37,89 @@ FEATURE_COLS = [
 ]
 
 N_FOLDS = 5
+MIN_TRAIN_SEASONS = 5   # require at least 5 seasons of history before validating
 
 
-def load_training_data() -> tuple[pd.DataFrame, pd.Series]:
+def load_training_data() -> tuple[pd.DataFrame, pd.Series, pd.Series]:
+    """Returns (X, y, seasons) — seasons needed for walk-forward CV."""
     path = DATA_DIR / "train_features.csv"
     if not path.exists():
         raise FileNotFoundError("Run src/features.py first to generate train_features.csv")
     df = pd.read_csv(path).dropna(subset=FEATURE_COLS)
-    return df[FEATURE_COLS], df["label"]
+    return df[FEATURE_COLS], df["label"], df["Season"]
 
+
+# ---------------------------------------------------------------------------
+# Season-aware walk-forward CV splitter
+# ---------------------------------------------------------------------------
+
+class SeasonWalkForwardCV:
+    """
+    Walk-forward cross-validator that splits by season.
+
+    For each validation season S (starting after MIN_TRAIN_SEASONS):
+        train  = all games from seasons before S
+        valid  = all games from season S
+
+    This mirrors real-world use: we only know past seasons when predicting
+    a future tournament.
+    """
+
+    def __init__(self, min_train_seasons: int = MIN_TRAIN_SEASONS):
+        self.min_train_seasons = min_train_seasons
+
+    def split(self, X: pd.DataFrame, y: pd.Series, seasons: pd.Series):
+        unique_seasons = sorted(seasons.unique())
+        for i, val_season in enumerate(unique_seasons):
+            if i < self.min_train_seasons:
+                continue
+            train_idx = seasons[seasons < val_season].index
+            val_idx   = seasons[seasons == val_season].index
+            yield (
+                X.index.get_indexer(train_idx),
+                X.index.get_indexer(val_idx),
+            )
+
+    def get_n_splits(self, seasons: pd.Series) -> int:
+        return max(0, seasons.nunique() - self.min_train_seasons)
+
+
+def _season_cross_validate(pipe, X, y, seasons, scoring_fns: dict) -> dict:
+    """Run walk-forward CV and return mean scores."""
+    cv = SeasonWalkForwardCV()
+    fold_scores = {k: [] for k in scoring_fns}
+
+    for train_idx, val_idx in cv.split(X, y, seasons):
+        X_tr, X_val = X.iloc[train_idx], X.iloc[val_idx]
+        y_tr, y_val = y.iloc[train_idx], y.iloc[val_idx]
+
+        pipe.fit(X_tr, y_tr)
+        probs = pipe.predict_proba(X_val)[:, 1]
+        preds = (probs >= 0.5).astype(int)
+
+        for name, fn in scoring_fns.items():
+            fold_scores[name].append(fn(y_val, probs if "loss" in name or "auc" in name or "brier" in name else preds))
+
+    return {k: np.mean(v) for k, v in fold_scores.items()}
+
+
+def _season_oof_predict(pipe, X, y, seasons) -> np.ndarray:
+    """Collect out-of-fold probability predictions using walk-forward CV."""
+    cv = SeasonWalkForwardCV()
+    oof = np.full(len(X), np.nan)
+
+    for train_idx, val_idx in cv.split(X, y, seasons):
+        X_tr, X_val = X.iloc[train_idx], X.iloc[val_idx]
+        y_tr = y.iloc[train_idx]
+        pipe.fit(X_tr, y_tr)
+        oof[val_idx] = pipe.predict_proba(X_val)[:, 1]
+
+    return oof
+
+
+# ---------------------------------------------------------------------------
+# Base pipelines
+# ---------------------------------------------------------------------------
 
 def build_base_pipelines() -> dict[str, Pipeline]:
     """Three base learners, each wrapped in a StandardScaler pipeline."""
@@ -67,55 +146,71 @@ def build_base_pipelines() -> dict[str, Pipeline]:
 
 
 # ---------------------------------------------------------------------------
-# Evaluation
+# Evaluation — random CV vs season-aware CV side-by-side
 # ---------------------------------------------------------------------------
 
-def evaluate_models(X: pd.DataFrame, y: pd.Series) -> pd.DataFrame:
-    """Cross-validated comparison of base learners + ensemble."""
-    cv = StratifiedKFold(n_splits=N_FOLDS, shuffle=True, random_state=42)
+def evaluate_models(X: pd.DataFrame, y: pd.Series, seasons: pd.Series) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Returns two DataFrames:
+        random_results   — classic 5-fold stratified CV
+        seasonal_results — walk-forward season CV
+    """
+    random_cv = StratifiedKFold(n_splits=N_FOLDS, shuffle=True, random_state=42)
     scoring = ["accuracy", "roc_auc", "neg_log_loss", "neg_brier_score"]
+    scoring_fns = {
+        "accuracy":    lambda yt, yp: accuracy_score(yt, yp >= 0.5),
+        "roc_auc":     roc_auc_score,
+        "log_loss":    log_loss,
+        "brier_score": brier_score_loss,
+    }
 
-    results = []
+    random_results = []
+    seasonal_results = []
     oof_preds = {}
 
     for name, pipe in build_base_pipelines().items():
-        print(f"  Cross-validating {name}...")
-        scores = cross_validate(pipe, X, y, cv=cv, scoring=scoring)
-        results.append({
-            "model": name,
-            "accuracy":    scores["test_accuracy"].mean(),
-            "roc_auc":     scores["test_roc_auc"].mean(),
-            "log_loss":   -scores["test_neg_log_loss"].mean(),
-            "brier_score":-scores["test_neg_brier_score"].mean(),
-        })
-        # Out-of-fold predictions for ensemble meta-learner
-        oof_preds[name] = cross_val_predict(
-            pipe, X, y, cv=cv, method="predict_proba"
-        )[:, 1]
+        print(f"  Evaluating {name}...")
 
-    # Evaluate ensemble using the same OOF predictions
+        # Random CV
+        r = cross_validate(pipe, X, y, cv=random_cv, scoring=scoring)
+        random_results.append({
+            "model": name,
+            "accuracy":    r["test_accuracy"].mean(),
+            "roc_auc":     r["test_roc_auc"].mean(),
+            "log_loss":   -r["test_neg_log_loss"].mean(),
+            "brier_score":-r["test_neg_brier_score"].mean(),
+        })
+
+        # Season-aware CV
+        s = _season_cross_validate(pipe, X, y, seasons, scoring_fns)
+        seasonal_results.append({"model": name, **s})
+
+        # OOF preds (season-aware) for ensemble meta-learner
+        oof_preds[name] = _season_oof_predict(pipe, X, y, seasons)
+
+    # Ensemble evaluation (season-aware OOF, ignoring NaN rows with no history)
     print("  Evaluating ensemble...")
-    ensemble_probs = _blend(oof_preds)
-    from sklearn.metrics import accuracy_score, brier_score_loss, log_loss, roc_auc_score
-    results.append({
+    mask = ~np.isnan(list(oof_preds.values())[0])
+    blend = np.column_stack([oof_preds[n][mask] for n in oof_preds]).mean(axis=1)
+    y_masked = y.values[mask]
+    random_results.append({
         "model": "ensemble",
-        "accuracy":    accuracy_score(y, ensemble_probs >= 0.5),
-        "roc_auc":     roc_auc_score(y, ensemble_probs),
-        "log_loss":    log_loss(y, ensemble_probs),
-        "brier_score": brier_score_loss(y, ensemble_probs),
+        "accuracy":    accuracy_score(y_masked, blend >= 0.5),
+        "roc_auc":     roc_auc_score(y_masked, blend),
+        "log_loss":    log_loss(y_masked, blend),
+        "brier_score": brier_score_loss(y_masked, blend),
+    })
+    seasonal_results.append({
+        "model": "ensemble",
+        "accuracy":    accuracy_score(y_masked, blend >= 0.5),
+        "roc_auc":     roc_auc_score(y_masked, blend),
+        "log_loss":    log_loss(y_masked, blend),
+        "brier_score": brier_score_loss(y_masked, blend),
     })
 
-    return pd.DataFrame(results).set_index("model").round(4)
-
-
-def _blend(oof_preds: dict[str, np.ndarray]) -> np.ndarray:
-    """
-    Fit a non-negative logistic regression meta-learner on OOF predictions
-    to learn optimal blend weights. Returns blended probabilities.
-    """
-    meta_X = np.column_stack(list(oof_preds.values()))
-    weights = np.array([1 / len(oof_preds)] * len(oof_preds))  # equal weight average
-    return meta_X @ weights
+    rdf = pd.DataFrame(random_results).set_index("model").round(4)
+    sdf = pd.DataFrame(seasonal_results).set_index("model").round(4)
+    return rdf, sdf
 
 
 # ---------------------------------------------------------------------------
@@ -126,13 +221,8 @@ class EnsemblePredictor:
     """
     Stacked ensemble of logistic, random forest, and gradient boosting.
 
-    Training:
-      1. Each base model is fit on all training data.
-      2. A meta-learner (logistic regression) is fit on out-of-fold base
-         model predictions to learn blend weights.
-
-    Prediction:
-      Each base model produces a probability; the meta-learner combines them.
+    Uses season-aware walk-forward CV to generate OOF predictions for the
+    meta-learner, avoiding leakage from future seasons into past predictions.
     """
 
     def __init__(self):
@@ -140,20 +230,20 @@ class EnsemblePredictor:
         self.meta_model: LogisticRegression | None = None
         self.base_names: list[str] = []
 
-    def fit(self, X: pd.DataFrame, y: pd.Series):
-        cv = StratifiedKFold(n_splits=N_FOLDS, shuffle=True, random_state=42)
+    def fit(self, X: pd.DataFrame, y: pd.Series, seasons: pd.Series):
         pipelines = build_base_pipelines()
         self.base_names = list(pipelines.keys())
 
-        # Step 1: collect out-of-fold predictions for meta-learner
+        # Step 1: season-aware OOF predictions for meta-learner
         oof_matrix = np.zeros((len(X), len(pipelines)))
         for i, (name, pipe) in enumerate(pipelines.items()):
-            print(f"  Generating OOF predictions: {name}...")
-            oof_matrix[:, i] = cross_val_predict(
-                pipe, X, y, cv=cv, method="predict_proba"
-            )[:, 1]
+            print(f"  Generating season-aware OOF: {name}...")
+            oof = _season_oof_predict(pipe, X, y, seasons)
+            # Fill early seasons (no history) with 0.5
+            oof = np.where(np.isnan(oof), 0.5, oof)
+            oof_matrix[:, i] = oof
 
-        # Step 2: fit meta-learner on OOF predictions
+        # Step 2: fit meta-learner
         print("  Fitting meta-learner...")
         self.meta_model = LogisticRegression(C=1.0, max_iter=1000, random_state=42)
         self.meta_model.fit(oof_matrix, y)
@@ -163,7 +253,7 @@ class EnsemblePredictor:
         for name, w in zip(self.base_names, weights):
             print(f"    {name:<20} {w:+.4f}")
 
-        # Step 3: fit each base model on ALL training data
+        # Step 3: fit each base model on ALL data
         for name, pipe in pipelines.items():
             print(f"  Training final base model: {name}...")
             calibrated = CalibratedClassifierCV(pipe, cv=N_FOLDS, method="isotonic")
@@ -193,10 +283,7 @@ class EnsemblePredictor:
 # ---------------------------------------------------------------------------
 
 def generate_submission(model: EnsemblePredictor) -> pd.DataFrame:
-    """
-    Predict win probabilities for ALL submission matchups.
-    Rows missing features fall back to 0.5.
-    """
+    """Predict win probabilities for ALL submission matchups. Missing → 0.5."""
     sub_path = DATA_DIR / "submission_features.csv"
     sample_path = DATA_DIR / "SampleSubmissionStage1.csv"
     if not sub_path.exists():
@@ -227,16 +314,20 @@ def generate_submission(model: EnsemblePredictor) -> pd.DataFrame:
 
 if __name__ == "__main__":
     print("Loading training data...")
-    X, y = load_training_data()
-    print(f"  {X.shape[0]} games, {X.shape[1]} features\n")
+    X, y, seasons = load_training_data()
+    print(f"  {X.shape[0]} games, {X.shape[1]} features, {seasons.nunique()} seasons\n")
 
-    print("Comparing models (5-fold CV)...")
-    results = evaluate_models(X, y)
-    print(f"\n{results.to_string()}\n")
+    print("Comparing models: random CV vs season-aware walk-forward CV...")
+    random_results, seasonal_results = evaluate_models(X, y, seasons)
 
-    print("Training ensemble on all data...")
+    print("\n--- Random 5-fold CV ---")
+    print(random_results.to_string())
+    print("\n--- Season-aware walk-forward CV ---")
+    print(seasonal_results.to_string())
+
+    print("\nTraining ensemble on all data (season-aware OOF)...")
     ensemble = EnsemblePredictor()
-    ensemble.fit(X, y)
+    ensemble.fit(X, y, seasons)
 
     MODEL_DIR.mkdir(exist_ok=True)
     ensemble.save(MODEL_DIR / "bracket_predictor.joblib")
