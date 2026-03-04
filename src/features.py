@@ -78,7 +78,7 @@ def compute_team_season_stats(detailed: pd.DataFrame) -> pd.DataFrame:
 
         keep = ["Season", "TeamID", "won", "score", "score_allowed",
                 "FGM", "FGA", "FGM3", "FGA3", "FTM", "FTA",
-                "OR", "DR", "Ast", "TO", "Stl", "Blk", "off_eff", "def_eff"]
+                "OR", "DR", "Ast", "TO", "Stl", "Blk", "off_eff", "def_eff", "poss"]
         rows.append(g[keep])
 
     combined = pd.concat(rows, ignore_index=True)
@@ -90,6 +90,7 @@ def compute_team_season_stats(detailed: pd.DataFrame) -> pd.DataFrame:
         avg_score_allowed=("score_allowed", "mean"),
         off_eff=("off_eff", "mean"),
         def_eff=("def_eff", "mean"),
+        total_poss=("poss", "sum"),
         FGM=("FGM", "sum"),
         FGA=("FGA", "sum"),
         FGM3=("FGM3", "sum"),
@@ -106,6 +107,7 @@ def compute_team_season_stats(detailed: pd.DataFrame) -> pd.DataFrame:
 
     agg["avg_margin"] = agg["avg_score"] - agg["avg_score_allowed"]
     agg["net_eff"] = agg["off_eff"] - agg["def_eff"]
+    agg["tempo"] = agg["total_poss"] / agg["num_games"]   # possessions per game
     agg["fg_pct"] = agg["FGM"] / agg["FGA"]
     agg["fg3_pct"] = agg["FGM3"] / agg["FGA3"]
     agg["ft_pct"] = agg["FTM"] / agg["FTA"]
@@ -114,7 +116,8 @@ def compute_team_season_stats(detailed: pd.DataFrame) -> pd.DataFrame:
     agg["stl_per_game"] = agg["Stl"] / agg["num_games"]
     agg["blk_per_game"] = agg["Blk"] / agg["num_games"]
 
-    drop_cols = ["FGM", "FGA", "FGM3", "FGA3", "FTM", "FTA", "OR", "DR", "Ast", "TO", "Stl", "Blk"]
+    drop_cols = ["FGM", "FGA", "FGM3", "FGA3", "FTM", "FTA", "OR", "DR",
+                 "Ast", "TO", "Stl", "Blk", "total_poss"]
     return agg.drop(columns=drop_cols)
 
 
@@ -161,6 +164,7 @@ def compute_massey_ranks(massey: pd.DataFrame, day_cutoff: int = 133) -> pd.Data
 DIFF_STATS = [
     "win_rate", "avg_score", "avg_score_allowed", "avg_margin",
     "off_eff", "def_eff", "net_eff",
+    "tempo",
     "fg_pct", "fg3_pct", "ft_pct",
     "oreb_rate", "ast_to_ratio", "stl_per_game", "blk_per_game",
     "seed_num", "massey_rank_mean", "massey_rank_min",

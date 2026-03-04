@@ -31,6 +31,7 @@ MODEL_DIR = Path(__file__).parent.parent / "models"
 FEATURE_COLS = [
     "diff_win_rate", "diff_avg_score", "diff_avg_score_allowed", "diff_avg_margin",
     "diff_off_eff", "diff_def_eff", "diff_net_eff",
+    "diff_tempo",
     "diff_fg_pct", "diff_fg3_pct", "diff_ft_pct",
     "diff_oreb_rate", "diff_ast_to_ratio", "diff_stl_per_game", "diff_blk_per_game",
     "diff_seed_num", "diff_massey_rank_mean", "diff_massey_rank_min",
